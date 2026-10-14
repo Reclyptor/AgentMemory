@@ -1,0 +1,11 @@
+# Agent specs live outside the tracked tree (one per branch)
+/SPEC/
+
+# Local test scratch
+/tests/.tmp/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
