@@ -17,7 +17,9 @@ tmp="$(cd "$(dirname "$0")" && pwd)/.tmp"
 cleanup() {
   docker rm -f "$engine" "$app" >/dev/null 2>&1 || true
   # The engine writes as 65532, so remove its files from inside a container.
-  [ -d "$tmp" ] && docker run --rm -v "$tmp:/t" --entrypoint sh "$image" -c 'rm -rf /t/*' >/dev/null 2>&1 || true
+  if [ -d "$tmp" ]; then
+    docker run --rm -v "$tmp:/t" --entrypoint sh "$image" -c 'rm -rf /t/*' >/dev/null 2>&1 || true
+  fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT
@@ -75,15 +77,20 @@ api POST /search '{"query":"RAIDZ2 padded","limit":5}' | grep -q 'flashstor' || 
 top="$(api POST /smart-search '{"query":"disk running out of space","limit":1}' | node -e 'console.log(JSON.parse(require("fs").readFileSync(0)).results[0]?.title ?? "")')"
 case "$top" in *flashstor*) ;; *) fail "semantic search ranked '$top' first" ;; esac
 
-read -r vectors pending < <(status)
-[ "$vectors" = 2 ] && [ "$pending" = 0 ] || fail "expected 2 vectors and none pending, got $vectors/$pending"
+expect_vectors() {
+  local vectors pending
+  read -r vectors pending < <(status)
+  if [ "$vectors" != 2 ] || [ "$pending" != 0 ]; then
+    fail "$1: expected 2 vectors and none pending, got $vectors/$pending"
+  fi
+}
+expect_vectors "after saving"
 
 # A clean shutdown must persist the index; the next boot loads it as is.
 docker stop -t 30 "$app" >/dev/null
 docker rm "$app" >/dev/null
 start_app
-read -r vectors pending < <(status)
-[ "$vectors" = 2 ] && [ "$pending" = 0 ] || fail "after restart expected 2 vectors and none pending, got $vectors/$pending"
+expect_vectors "after restart"
 docker logs "$app" 2>&1 | grep -q 'Re-embedding' && fail "restart re-embedded instead of loading the saved index"
 
 echo "smoke test passed"
