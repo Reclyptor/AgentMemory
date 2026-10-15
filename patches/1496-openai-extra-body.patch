@@ -1,0 +1,125 @@
+diff --git a/.env.example b/.env.example
+index 6f11225..077e5bd 100644
+--- a/.env.example
++++ b/.env.example
+@@ -45,6 +45,7 @@
+ # OPENAI_API_KEY=sk-...                          # Activates both the OpenAI-compatible LLM provider (DeepSeek, SiliconFlow, vLLM, LM Studio, Ollama via `/v1`) and OpenAI embeddings. Set OPENAI_API_KEY_FOR_LLM=false to scope it to embeddings only.
+ # OPENAI_BASE_URL=https://api.openai.com         # Override for OpenAI-compatible providers
+ # OPENAI_MODEL=gpt-5.6-luna                      # Default OpenAI-compatible chat model
++# OPENAI_EXTRA_BODY={"provider":{"order":["deepinfra"]}}  # JSON object merged into every chat request (e.g. OpenRouter provider routing); agentmemory's own fields win
+ # OPENAI_API_KEY_FOR_LLM=false                   # Skip OpenAI auto-detection for LLM; key stays active for embeddings
+ 
+ # ANTHROPIC_API_KEY=sk-ant-...
+diff --git a/src/providers/openai.ts b/src/providers/openai.ts
+index 46500cf..66a00ef 100644
+--- a/src/providers/openai.ts
++++ b/src/providers/openai.ts
+@@ -43,6 +43,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
+  *                              thinking models). Set to "none" to ensure
+  *                              message.content is populated instead of only
+  *                              message.reasoning.
++ *   OPENAI_EXTRA_BODY        — JSON object merged into every chat request, for
++ *                              endpoint-specific fields such as OpenRouter's
++ *                              `provider` routing object. Fields set above win.
+  */
+ export class OpenAIProvider implements MemoryProvider {
+   name = "openai";
+@@ -51,6 +54,7 @@ export class OpenAIProvider implements MemoryProvider {
+   private maxTokens: number;
+   private baseUrl: string;
+   private reasoningEffort?: string;
++  private extraBody: Record<string, unknown>;
+   private timeoutMs: number;
+   private isAzure: boolean;
+   private azureApiVersion: string;
+@@ -61,6 +65,7 @@ export class OpenAIProvider implements MemoryProvider {
+     this.maxTokens = maxTokens;
+     this.baseUrl = normalizeBaseUrl(baseURL || getEnvVar("OPENAI_BASE_URL"));
+     this.reasoningEffort = getEnvVar("OPENAI_REASONING_EFFORT") || undefined;
++    this.extraBody = parseExtraBody(getEnvVar("OPENAI_EXTRA_BODY"));
+     this.timeoutMs = resolveTimeout();
+     this.azureApiVersion =
+       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
+@@ -78,6 +83,7 @@ export class OpenAIProvider implements MemoryProvider {
+   private async call(systemPrompt: string, userPrompt: string): Promise<string> {
+     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
+     const body: Record<string, unknown> = {
++      ...this.extraBody,
+       model: this.model,
+       max_tokens: this.maxTokens,
+       stream: false,
+@@ -160,3 +166,16 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
+   return Number.isFinite(n) && n > 0 ? n : undefined;
+ }
+ 
++function parseExtraBody(raw: string | null | undefined): Record<string, unknown> {
++  if (!raw || !raw.trim()) return {};
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(raw);
++  } catch {
++    parsed = undefined;
++  }
++  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
++    throw new Error('OPENAI_EXTRA_BODY must be a JSON object, e.g. {"provider":{"order":["deepinfra"]}}');
++  }
++  return parsed as Record<string, unknown>;
++}
+diff --git a/test/openai-extra-body.test.ts b/test/openai-extra-body.test.ts
+new file mode 100644
+index 0000000..58d5510
+--- /dev/null
++++ b/test/openai-extra-body.test.ts
+@@ -0,0 +1,52 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++import { OpenAIProvider } from "../src/providers/openai.js";
++
++function captureRequestBody(): () => Record<string, unknown> {
++  let sent: Record<string, unknown> = {};
++  vi.spyOn(globalThis, "fetch").mockImplementation((async (_url: string, init?: RequestInit) => {
++    sent = JSON.parse(String(init?.body));
++    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
++      status: 200,
++      headers: { "content-type": "application/json" },
++    });
++  }) as typeof fetch);
++  return () => sent;
++}
++
++describe("OPENAI_EXTRA_BODY", () => {
++  beforeEach(() => {
++    delete process.env["OPENAI_EXTRA_BODY"];
++    delete process.env["OPENAI_REASONING_EFFORT"];
++  });
++  afterEach(() => {
++    delete process.env["OPENAI_EXTRA_BODY"];
++    delete process.env["OPENAI_REASONING_EFFORT"];
++    vi.restoreAllMocks();
++  });
++
++  it("leaves the request body unchanged when unset", async () => {
++    const body = captureRequestBody();
++    await new OpenAIProvider("k", "m", 100).compress("s", "u");
++    expect(Object.keys(body()).sort()).toEqual(["max_tokens", "messages", "model", "stream"]);
++  });
++
++  it("adds the configured fields to the request", async () => {
++    process.env["OPENAI_EXTRA_BODY"] = '{"provider":{"order":["deepinfra"],"allow_fallbacks":false}}';
++    const body = captureRequestBody();
++    await new OpenAIProvider("k", "m", 100).compress("s", "u");
++    expect(body()["provider"]).toEqual({ order: ["deepinfra"], allow_fallbacks: false });
++  });
++
++  it("never lets the extra body override the fields agentmemory sets", async () => {
++    process.env["OPENAI_EXTRA_BODY"] = '{"model":"x","max_tokens":1,"stream":true,"reasoning_effort":"high"}';
++    process.env["OPENAI_REASONING_EFFORT"] = "none";
++    const body = captureRequestBody();
++    await new OpenAIProvider("k", "m", 100).compress("s", "u");
++    expect(body()).toMatchObject({ model: "m", max_tokens: 100, stream: false, reasoning_effort: "none" });
++  });
++
++  it.each(["not json", "[1,2]", "null", "42"])("rejects %s at construction", (raw) => {
++    process.env["OPENAI_EXTRA_BODY"] = raw;
++    expect(() => new OpenAIProvider("k", "m", 100)).toThrow(/OPENAI_EXTRA_BODY must be a JSON object/);
++  });
++});

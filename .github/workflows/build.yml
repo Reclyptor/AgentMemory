@@ -55,16 +55,18 @@ jobs:
       - name: Smoke Test
         run: tests/smoke.sh agentmemory:ci
 
-      # <upstream version>-<upstream commit> is the pin the cluster references.
-      # The timestamped tag is immutable per build, since a rebuild of the
-      # same pin can resolve newer dependencies.
+      # <upstream version>-<upstream commit>[-pr<N>...] is the pin the cluster
+      # references, one -pr<N> per upstream PR applied from patches/. The
+      # timestamped tag is immutable per build, since a rebuild of the same
+      # pin can resolve newer dependencies.
       - name: Compute Tags
         id: tags
         run: |
           version="$(docker run --rm --entrypoint node agentmemory:ci -p "require('/usr/local/lib/node_modules/@agentmemory/agentmemory/package.json').version")"
           commit="$(docker inspect -f '{{ index .Config.Labels "io.github.rohitg00.agentmemory.commit" }}' agentmemory:ci)"
-          echo "pin=${version}-${commit:0:7}" >> "$GITHUB_OUTPUT"
-          echo "build=${version}-${commit:0:7}-$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          prs="$(find patches -name '*.patch' -printf '%f\n' | sort -n | sed -E 's/^([0-9]+)-.*/-pr\1/' | tr -d '\n')"
+          echo "pin=${version}-${commit:0:7}${prs}" >> "$GITHUB_OUTPUT"
+          echo "build=${version}-${commit:0:7}${prs}-$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Log In to GitHub Container Registry
         if: github.event_name != 'pull_request'

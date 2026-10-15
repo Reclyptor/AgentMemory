@@ -19,10 +19,20 @@ The current pin is v0.9.30 plus upstream #1507, which fixes 0.9.30 completing a
 session at its first Stop (upstream issue #745). Move to the first npm release
 that contains it once one ships.
 
+`patches/` holds open upstream PRs applied on top of the pin, each named
+`<PR number>-<slug>.patch` and carrying only the PR's source and test changes.
+The build fails if one stops applying.
+
+- `1496-openai-extra-body.patch`: upstream #1496, `OPENAI_EXTRA_BODY`, a JSON
+  object merged into every OpenAI-compatible chat request. The cluster uses it
+  to send a vLLM `priority`, so agentmemory's background work yields to
+  interactive agents.
+
 ## Tags
 
-- `<version>-<upstream commit>` (for example `0.9.30-df3d4a8`) is the pin the
-  cluster references.
+- `<version>-<upstream commit>[-pr<N>...]` (for example
+  `0.9.30-df3d4a8-pr1496`) is the pin the cluster references, with one
+  `-pr<N>` per applied patch.
 - `<version>-<upstream commit>-<timestamp>-<repo commit>` is immutable per
   build.
 
@@ -39,7 +49,8 @@ restart. CI runs the same script before anything is pushed.
 
 ## Bumping
 
-1. Change `AGENTMEMORY_COMMIT` in the `Dockerfile`.
+1. Change `AGENTMEMORY_COMMIT` in the `Dockerfile`, and delete any patch whose
+   PR the new commit contains.
 2. Push to `master`. CI builds, tests and publishes.
 3. In the same change set, update the image tag (and the engine version if the
    bundled `iii-sdk` moved) in `Reclyptor/Kubernetes` `infra/agentmemory`, and

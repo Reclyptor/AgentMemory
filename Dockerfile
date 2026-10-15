@@ -4,6 +4,9 @@
 # on its first Stop (issue #745) and is in no npm release yet. Move to the
 # first release that contains it once one ships.
 #
+# patches/ holds open upstream PRs applied on top of the pin, named
+# <PR number>-<slug>.patch. Drop each one once a release contains its PR.
+#
 # The image carries everything the pod used to install at startup, including
 # the local embedding model, so the pod needs no npm, GitHub or Hugging Face
 # egress.
@@ -18,10 +21,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 ADD https://codeload.github.com/rohitg00/agentmemory/tar.gz/${AGENTMEMORY_COMMIT} /tmp/src.tar.gz
 WORKDIR /src
+COPY patches/ /tmp/patches/
 # Upstream's release steps (.github/workflows/publish.yml): the repo carries no
 # lockfile, so it resolves one and installs from it. Then pack the same files a
 # release would publish.
 RUN tar xzf /tmp/src.tar.gz --strip-components=1 \
+ && for p in /tmp/patches/*.patch; do [ -e "$p" ] || continue; git apply --verbose "$p"; done \
  && npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund \
  && npm ci --legacy-peer-deps --no-audit --no-fund \
  && npm run build \
