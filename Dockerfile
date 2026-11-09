@@ -5,7 +5,8 @@
 # first release that contains it once one ships.
 #
 # patches/ holds open upstream PRs applied on top of the pin, named
-# <PR number>-<slug>.patch. Drop each one once a release contains its PR.
+# <PR number>-<slug>.patch, then local fixes with no upstream PR, named
+# local-<slug>.patch. Drop each one once a release contains its change.
 #
 # The image carries everything the pod used to install at startup, including
 # the local embedding model, so the pod needs no npm, GitHub or Hugging Face

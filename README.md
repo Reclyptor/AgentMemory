@@ -19,20 +19,29 @@ The current pin is v0.9.30 plus upstream #1507, which fixes 0.9.30 completing a
 session at its first Stop (upstream issue #745). Move to the first npm release
 that contains it once one ships.
 
-`patches/` holds open upstream PRs applied on top of the pin, each named
-`<PR number>-<slug>.patch` and carrying only the PR's source and test changes.
+`patches/` holds changes applied on top of the pin, each carrying only source
+and test changes. Open upstream PRs are named `<PR number>-<slug>.patch`;
+fixes with no upstream PR are named `local-<slug>.patch` and apply after them.
 The build fails if one stops applying.
 
 - `1496-openai-extra-body.patch`: upstream #1496, `OPENAI_EXTRA_BODY`, a JSON
   object merged into every OpenAI-compatible chat request. The cluster uses it
   to send a vLLM `priority`, so agentmemory's background work yields to
   interactive agents.
+- `local-observe-scope-reads.patch`: `mem::observe` dedups a durable
+  observation id with one `state::get` and lists the session's observation
+  scope only when `MAX_OBS_PER_SESSION` or the synthetic (non-auto-compress)
+  source budget needs it. Upstream lists the whole scope on every observation,
+  which is quadratic over a session and, once the scope passes the SDK's
+  100 MiB frame limit, drops the worker connection on every capture into that
+  session. Upstream v0.9.33 still does this.
 
 ## Tags
 
-- `<version>-<upstream commit>[-pr<N>...]` (for example
-  `0.9.30-df3d4a8-pr1496`) is the pin the cluster references, with one
-  `-pr<N>` per applied patch.
+- `<version>-<upstream commit>[-pr<N>...][-<slug>...]` (for example
+  `0.9.30-df3d4a8-pr1496-observe-scope-reads`) is the pin the cluster
+  references, with one `-pr<N>` per upstream PR patch and one `-<slug>` per
+  local patch.
 - `<version>-<upstream commit>-<timestamp>-<repo commit>` is immutable per
   build.
 
