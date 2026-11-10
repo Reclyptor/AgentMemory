@@ -28,10 +28,12 @@ The build fails if one stops applying.
   object merged into every OpenAI-compatible chat request. The cluster uses it
   to send a vLLM `priority`, so agentmemory's background work yields to
   interactive agents.
-- `local-observe-scope-reads.patch`: `mem::observe` dedups a durable
-  observation id with one `state::get` and lists the session's observation
-  scope only when `MAX_OBS_PER_SESSION` or the synthetic (non-auto-compress)
-  source budget needs it. Upstream lists the whole scope on every observation,
+- `local-observation-scope-reads.patch`: `mem::observe` and `mem::compress`
+  stop listing the session's whole observation scope on every write. Observe
+  dedups a durable id with one `state::get`; the per-session cap and the source
+  budget read running per-session totals (`src/state/observation-tally.ts`)
+  that `StateKV` keeps current on every observation write, loaded with one list
+  per session. Upstream lists the scope on every observation and compression,
   which is quadratic over a session and, once the scope passes the SDK's
   100 MiB frame limit, drops the worker connection on every capture into that
   session. Upstream v0.9.33 still does this.
@@ -39,7 +41,7 @@ The build fails if one stops applying.
 ## Tags
 
 - `<version>-<upstream commit>[-pr<N>...][-<slug>...]` (for example
-  `0.9.30-df3d4a8-pr1496-observe-scope-reads`) is the pin the cluster
+  `0.9.30-df3d4a8-pr1496-observation-scope-reads`) is the pin the cluster
   references, with one `-pr<N>` per upstream PR patch and one `-<slug>` per
   local patch.
 - `<version>-<upstream commit>-<timestamp>-<repo commit>` is immutable per

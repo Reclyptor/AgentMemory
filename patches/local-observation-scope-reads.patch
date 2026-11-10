@@ -1,0 +1,617 @@
+diff --git a/src/functions/compress.ts b/src/functions/compress.ts
+index eb30b1c..69414d2 100644
+--- a/src/functions/compress.ts
++++ b/src/functions/compress.ts
+@@ -24,6 +24,7 @@ import type { MetricsStore } from "../eval/metrics-store.js";
+ import { logger } from "../logger.js";
+ import { createObservationSource, withoutObservationSource } from "./observation-source.js";
+ import { budgetLiveObservationSource } from "./observation-source-budget.js";
++import { sessionObservationTotals } from "../state/observation-tally.js";
+ import { withKeyedLock } from "../state/keyed-mutex.js";
+ import { scrubRecord, stripPrivateData } from "./privacy.js";
+ 
+@@ -180,7 +181,7 @@ export function registerCompressFunction(
+         };
+ 
+         const compressed = await withKeyedLock(`obs:${data.sessionId}`, async () => {
+-          const existing = await kv.list<CompressedObservation>(KV.observations(data.sessionId));
++          const existing = await sessionObservationTotals(kv, data.sessionId, data.observationId);
+           const bounded = budgetLiveObservationSource(candidate, existing);
+           await kv.set(KV.observations(data.sessionId), data.observationId, bounded);
+           return bounded;
+diff --git a/src/functions/observation-source-budget.ts b/src/functions/observation-source-budget.ts
+index e16748c..0d8c1e5 100644
+--- a/src/functions/observation-source-budget.ts
++++ b/src/functions/observation-source-budget.ts
+@@ -1,37 +1,34 @@
+ import type { CompressedObservation } from "../types.js";
+-import { checkPayloadFrameSize, payloadByteLength, SAFE_PAYLOAD_BYTES, type OversizedPayload } from "../state/frame-guard.js";
++import { oversizedPayloadError, payloadByteLength, SAFE_PAYLOAD_BYTES, type OversizedPayload } from "../state/frame-guard.js";
++import { observationRowTotals, type ObservationRowTotals } from "../state/observation-tally.js";
+ import { normalizeObservationSource, OBSERVATION_SOURCE_MAX_BYTES, withoutObservationSource } from "./observation-source.js";
+ 
+ export const SESSION_SOURCE_MAX_BYTES = 8 * 1024 * 1024;
+ 
+-export function budgetLiveObservationSource(
+-  observation: CompressedObservation,
+-  existing: CompressedObservation[],
+-): CompressedObservation {
+-  const planned = budgetImportedObservationSources([observation], existing);
+-  return planned.success ? planned.observations[0]! : withoutObservationSource(observation);
+-}
++const EMPTY_SESSION_RESPONSE_BYTES = payloadByteLength({
++  message_type: "invocation_result",
++  invocation_id: "00000000-0000-0000-0000-000000000000",
++  result: [],
++});
+ 
+-export function budgetImportedObservationSources(
+-  incoming: CompressedObservation[],
+-  existing: CompressedObservation[] = [],
+-  strategy: "merge" | "replace" | "skip" = "merge",
+-): { success: true; observations: CompressedObservation[]; sourceTruncated: number; sourceOmitted: number } | OversizedPayload {
+-  const existingById = new Map(existing.map((row) => [row.id, row]));
+-  const rows = incoming.map((row) => ({ ...row, source: normalizeObservationSource(row.source) }));
+-  const written = rows.filter((row) => strategy !== "skip" || !existingById.has(row.id));
+-  const replacedIds = new Set(written.map((row) => row.id));
+-  const kept = strategy === "replace" ? [] : existing.filter((row) => !replacedIds.has(row.id));
+-  const base = [...kept, ...written.map(withoutObservationSource)];
+-  const envelope = { message_type: "invocation_result", invocation_id: "00000000-0000-0000-0000-000000000000", result: base };
+-  const oversized = checkPayloadFrameSize(envelope, "observation summaries already exceed one session response; split the import into smaller sessions");
+-  if (oversized) return oversized;
++type BudgetResult =
++  | { success: true; observations: CompressedObservation[]; sourceTruncated: number; sourceOmitted: number }
++  | OversizedPayload;
++
++// kept: totals of the stored rows the write leaves in place. Totals add up to
++// the session's whole response: each row's bytes plus a comma between rows.
++function budgetAgainst(rows: CompressedObservation[], written: CompressedObservation[], kept: ObservationRowTotals): BudgetResult {
++  const writtenBytes = written.reduce((sum, row) => sum + payloadByteLength(withoutObservationSource(row)), 0);
++  const count = kept.rows + written.length;
++  const responseBytes = EMPTY_SESSION_RESPONSE_BYTES + kept.bytes + writtenBytes + Math.max(0, count - 1);
++  if (responseBytes > SAFE_PAYLOAD_BYTES) {
++    return oversizedPayloadError(responseBytes, "observation summaries already exceed one session response; split the import into smaller sessions");
++  }
+ 
+-  const existingSourceBytes = kept.reduce((sum, row) => sum + (row.source ? payloadByteLength(row.source) + 10 : 0), 0);
+   const sourceRows = written.filter((row) => row.source !== undefined);
+   const available = Math.max(0, Math.min(
+-    SESSION_SOURCE_MAX_BYTES - existingSourceBytes,
+-    SAFE_PAYLOAD_BYTES - payloadByteLength(envelope) - 64 * 1024,
++    SESSION_SOURCE_MAX_BYTES - kept.sourceBytes,
++    SAFE_PAYLOAD_BYTES - responseBytes - 64 * 1024,
+   ));
+   const incomingSourceBytes = sourceRows.reduce((sum, row) => sum + payloadByteLength(row.source) + 10, 0);
+   const perSource = incomingSourceBytes <= available
+@@ -52,3 +49,29 @@ export function budgetImportedObservationSources(
+   }
+   return { success: true, observations: rows, sourceTruncated, sourceOmitted };
+ }
++
++// existing: totals of the session's stored rows, leaving out the row this write
++// replaces; null when they can't be read, which keeps the summary and drops the
++// source.
++export function budgetLiveObservationSource(
++  observation: CompressedObservation,
++  existing: ObservationRowTotals | null,
++): CompressedObservation {
++  if (!existing) return withoutObservationSource(observation);
++  const row = { ...observation, source: normalizeObservationSource(observation.source) };
++  const planned = budgetAgainst([row], [row], existing);
++  return planned.success ? planned.observations[0]! : withoutObservationSource(observation);
++}
++
++export function budgetImportedObservationSources(
++  incoming: CompressedObservation[],
++  existing: CompressedObservation[] = [],
++  strategy: "merge" | "replace" | "skip" = "merge",
++): BudgetResult {
++  const existingById = new Map(existing.map((row) => [row.id, row]));
++  const rows = incoming.map((row) => ({ ...row, source: normalizeObservationSource(row.source) }));
++  const written = rows.filter((row) => strategy !== "skip" || !existingById.has(row.id));
++  const replacedIds = new Set(written.map((row) => row.id));
++  const kept = strategy === "replace" ? [] : existing.filter((row) => !replacedIds.has(row.id));
++  return budgetAgainst(rows, written, observationRowTotals(kept));
++}
+diff --git a/src/functions/observe.ts b/src/functions/observe.ts
+index 2b695d8..bc426be 100644
+--- a/src/functions/observe.ts
++++ b/src/functions/observe.ts
+@@ -20,6 +20,7 @@ import { logger } from "../logger.js";
+ import { saveImageToDisk } from "../utils/image-store.js";
+ import { withoutObservationSource } from "./observation-source.js";
+ import { budgetLiveObservationSource } from "./observation-source-budget.js";
++import { sessionObservationTotals } from "../state/observation-tally.js";
+ 
+ export function extractImage(d: unknown): string | undefined {
+   if (!d) return undefined;
+@@ -183,8 +184,13 @@ export function registerObserveFunction(
+       const promptRef = durable || typeof payload.eventId !== "string" ? obsId : payload.eventId;
+ 
+       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+-        const existing = await kv.list<CompressedObservation>(KV.observations(payload.sessionId));
+-        const stored = durable ? existing.find((o) => o?.id === obsId) : undefined;
++        // A session's observations grow without bound, and a scope bigger
++        // than one engine frame can't be listed at all: the SDK drops the
++        // connection and every in-flight call with it. Look the durable id up
++        // directly, and take counts from the session's running totals.
++        const stored = durable
++          ? await kv.get<CompressedObservation>(KV.observations(payload.sessionId), obsId)
++          : null;
+         if (stored) {
+           if (livePrompt) await recordLivePrompt(kv, payload.sessionId, livePrompt, promptRef);
+           await restoreIndexEntries(stored);
+@@ -194,8 +200,10 @@ export function registerObserveFunction(
+           recordDedupSkip();
+           return { deduplicated: true, sessionId: payload.sessionId };
+         }
++        const autoCompress = isAutoCompressEnabled();
+         if (maxObservationsPerSession && maxObservationsPerSession > 0) {
+-          if (existing.length >= maxObservationsPerSession) {
++          const totals = await sessionObservationTotals(kv, payload.sessionId);
++          if (!totals || totals.rows >= maxObservationsPerSession) {
+             return {
+               success: false,
+               error: `Session observation limit reached (${maxObservationsPerSession})`,
+@@ -368,7 +376,7 @@ export function registerObserveFunction(
+         // Default path: build a zero-LLM synthetic compression so recall
+         // and BM25 search still work without burning the user's Claude
+         // token allocation on every tool invocation.
+-        if (isAutoCompressEnabled()) {
++        if (autoCompress) {
+           await sdk.trigger({
+             function_id: "mem::compress",
+             payload: {
+@@ -379,7 +387,10 @@ export function registerObserveFunction(
+             action: TriggerAction.Void(),
+           });
+         } else {
+-          const synthetic = budgetLiveObservationSource(buildSyntheticCompression(raw), existing);
++          const synthetic = budgetLiveObservationSource(
++            buildSyntheticCompression(raw),
++            await sessionObservationTotals(kv, payload.sessionId, obsId),
++          );
+           await kv.set(
+             KV.observations(payload.sessionId),
+             obsId,
+@@ -414,7 +425,7 @@ export function registerObserveFunction(
+           obsId,
+           sessionId: payload.sessionId,
+           hook: payload.hookType,
+-          compress: isAutoCompressEnabled() ? "llm" : "synthetic",
++          compress: autoCompress ? "llm" : "synthetic",
+         });
+         return { observationId: obsId };
+       });
+diff --git a/src/state/kv.ts b/src/state/kv.ts
+index a1b1ddc..c1da933 100644
+--- a/src/state/kv.ts
++++ b/src/state/kv.ts
+@@ -1,5 +1,6 @@
+ import type { IIIClient } from 'iii-sdk'
+ import { withKeyedLock } from './keyed-mutex.js'
++import { noteObservationWrite } from './observation-tally.js'
+ 
+ export type StateBackend = 'file' | 'redis'
+ 
+@@ -119,10 +120,12 @@ export class StateKV {
+   }
+ 
+   async set<T = unknown>(scope: string, key: string, value: T): Promise<T> {
+-    return this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
++    const result = await this.sdk.trigger<{ scope: string; key: string; value: T }, T>({
+       function_id: 'state::set',
+       payload: { scope, key, value },
+     })
++    noteObservationWrite(this, scope, key, value)
++    return result
+   }
+ 
+   async update<T = unknown>(scope: string, key: string, ops: UpdateOp[]): Promise<T> {
+@@ -135,17 +138,20 @@ export class StateKV {
+         return result as T
+       })
+     }
+-    return this.sdk.trigger<{ scope: string; key: string; ops: UpdateOp[] }, T>({
++    const result = await this.sdk.trigger<{ scope: string; key: string; ops: UpdateOp[] }, T>({
+       function_id: 'state::update',
+       payload: { scope, key, ops },
+     })
++    noteObservationWrite(this, scope, key, (result as Partial<UpdateResult> | null)?.new_value ?? undefined)
++    return result
+   }
+ 
+   async delete(scope: string, key: string): Promise<void> {
+-    return this.sdk.trigger<{ scope: string; key: string }, void>({
++    await this.sdk.trigger<{ scope: string; key: string }, void>({
+       function_id: 'state::delete',
+       payload: { scope, key },
+     })
++    noteObservationWrite(this, scope, key, null)
+   }
+ 
+   async list<T = unknown>(scope: string): Promise<T[]> {
+diff --git a/src/state/observation-tally.ts b/src/state/observation-tally.ts
+new file mode 100644
+index 0000000..9ca1bcc
+--- /dev/null
++++ b/src/state/observation-tally.ts
+@@ -0,0 +1,141 @@
++import type { CompressedObservation } from "../types.js";
++import { payloadByteLength } from "./frame-guard.js";
++
++// Running per-session totals of a session's observation scope, so the source
++// budget doesn't list the whole scope on every write. A session's scope grows
++// without bound, and once it outgrows one engine frame a list can't be read at
++// all. Every write to an observation scope must be reported through
++// noteObservationWrite (StateKV does this); totals load with one list the first
++// time a session needs them.
++
++const OBSERVATION_SCOPE_PREFIX = "mem:obs:";
++const MAX_TRACKED_SESSIONS = 64;
++
++export type ObservationRowTotals = { rows: number; bytes: number; sourceBytes: number };
++
++type RowContribution = { bytes: number; sourceBytes: number };
++
++type SessionTally = {
++  rows: Map<string, RowContribution>;
++  bytes: number;
++  sourceBytes: number;
++};
++
++type KvTallies = {
++  sessions: Map<string, SessionTally>;
++  writes: Map<string, number>;
++  unreadable: Set<string>;
++};
++
++type ListingKV = { list<T = unknown>(scope: string): Promise<T[]> };
++
++const byKv = new WeakMap<object, KvTallies>();
++
++function talliesFor(kv: object): KvTallies {
++  let tallies = byKv.get(kv);
++  if (!tallies) {
++    tallies = { sessions: new Map(), writes: new Map(), unreadable: new Set() };
++    byKv.set(kv, tallies);
++  }
++  return tallies;
++}
++
++export function observationRowContribution(row: CompressedObservation): RowContribution {
++  return {
++    bytes: payloadByteLength(row),
++    sourceBytes: row.source ? payloadByteLength(row.source) + 10 : 0,
++  };
++}
++
++export function observationRowTotals(rows: CompressedObservation[]): ObservationRowTotals {
++  let bytes = 0;
++  let sourceBytes = 0;
++  for (const row of rows) {
++    const c = observationRowContribution(row);
++    bytes += c.bytes;
++    sourceBytes += c.sourceBytes;
++  }
++  return { rows: rows.length, bytes, sourceBytes };
++}
++
++function isRow(value: unknown): value is CompressedObservation {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++// value: the row now stored, null when the key was deleted, or undefined when
++// the new value isn't known (the session's totals are dropped and reload).
++export function noteObservationWrite(kv: object, scope: string, key: string, value: unknown): void {
++  if (!scope.startsWith(OBSERVATION_SCOPE_PREFIX)) return;
++  const sessionId = scope.slice(OBSERVATION_SCOPE_PREFIX.length);
++  const tallies = talliesFor(kv);
++  tallies.writes.set(sessionId, (tallies.writes.get(sessionId) ?? 0) + 1);
++  const tally = tallies.sessions.get(sessionId);
++  if (!tally) return;
++  if (value === undefined) {
++    tallies.sessions.delete(sessionId);
++    return;
++  }
++  const previous = tally.rows.get(key);
++  if (previous) {
++    tally.bytes -= previous.bytes;
++    tally.sourceBytes -= previous.sourceBytes;
++    tally.rows.delete(key);
++  }
++  if (isRow(value)) {
++    const next = observationRowContribution(value);
++    tally.rows.set(key, next);
++    tally.bytes += next.bytes;
++    tally.sourceBytes += next.sourceBytes;
++  }
++}
++
++async function loadTally(kv: ListingKV, tallies: KvTallies, sessionId: string): Promise<SessionTally | null> {
++  const cached = tallies.sessions.get(sessionId);
++  if (cached) {
++    tallies.sessions.delete(sessionId);
++    tallies.sessions.set(sessionId, cached);
++    return cached;
++  }
++  if (tallies.unreadable.has(sessionId)) return null;
++  const writesBefore = tallies.writes.get(sessionId) ?? 0;
++  let rows: CompressedObservation[];
++  try {
++    rows = (await kv.list<CompressedObservation>(`${OBSERVATION_SCOPE_PREFIX}${sessionId}`)).filter(isRow);
++  } catch {
++    tallies.unreadable.add(sessionId);
++    return null;
++  }
++  const tally: SessionTally = { rows: new Map(), bytes: 0, sourceBytes: 0 };
++  for (const row of rows) {
++    const c = observationRowContribution(row);
++    tally.rows.set(row.id, c);
++    tally.bytes += c.bytes;
++    tally.sourceBytes += c.sourceBytes;
++  }
++  // A write that landed while the list was in flight may or may not be in it,
++  // so the result is good for this call only.
++  if ((tallies.writes.get(sessionId) ?? 0) !== writesBefore) return tally;
++  tallies.sessions.set(sessionId, tally);
++  if (tallies.sessions.size > MAX_TRACKED_SESSIONS) {
++    const oldest = tallies.sessions.keys().next().value;
++    if (oldest !== undefined) tallies.sessions.delete(oldest);
++  }
++  return tally;
++}
++
++// Totals for the session's stored observations, leaving out excludeId (the row
++// a write is about to replace). Null when the scope can't be read.
++export async function sessionObservationTotals(
++  kv: ListingKV,
++  sessionId: string,
++  excludeId?: string,
++): Promise<ObservationRowTotals | null> {
++  const tally = await loadTally(kv, talliesFor(kv), sessionId);
++  if (!tally) return null;
++  const excluded = excludeId ? tally.rows.get(excludeId) : undefined;
++  return {
++    rows: tally.rows.size - (excluded ? 1 : 0),
++    bytes: tally.bytes - (excluded?.bytes ?? 0),
++    sourceBytes: tally.sourceBytes - (excluded?.sourceBytes ?? 0),
++  };
++}
+diff --git a/test/helpers/mocks.ts b/test/helpers/mocks.ts
+index 7b3fd33..9dd8b36 100644
+--- a/test/helpers/mocks.ts
++++ b/test/helpers/mocks.ts
+@@ -1,5 +1,6 @@
+ import { vi } from "vitest";
+ import { KV } from "../../src/state/schema.js";
++import { noteObservationWrite } from "../../src/state/observation-tally.js";
+ 
+ type Handler = (data: unknown) => Promise<unknown>;
+ 
+@@ -7,9 +8,11 @@ export function currentAuditScope(): string {
+   return KV.auditMonth(new Date().toISOString().slice(0, 7));
+ }
+ 
++// Reports observation writes like StateKV does, so the observation tally
++// stays in step with the store.
+ export function mockKV() {
+   const store = new Map<string, Map<string, unknown>>();
+-  return {
++  const kv = {
+     store,
+     get: async <T>(scope: string, key: string): Promise<T | null> => {
+       return (store.get(scope)?.get(key) as T) ?? null;
+@@ -24,20 +27,24 @@ export function mockKV() {
+       const value = (entries.get(key) as Record<string, unknown>) ?? {};
+       for (const u of updates) value[u.path] = u.value;
+       entries.set(key, value);
++      noteObservationWrite(kv, scope, key, value);
+     },
+     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+       if (!store.has(scope)) store.set(scope, new Map());
+       store.get(scope)!.set(key, data);
++      noteObservationWrite(kv, scope, key, data);
+       return data;
+     },
+     delete: async (scope: string, key: string): Promise<void> => {
+       store.get(scope)?.delete(key);
++      noteObservationWrite(kv, scope, key, null);
+     },
+     list: async <T>(scope: string): Promise<T[]> => {
+       const entries = store.get(scope);
+       return entries ? (Array.from(entries.values()) as T[]) : [];
+     },
+   };
++  return kv;
+ }
+ 
+ export function mockSdk(opts?: { looseTrigger?: boolean }) {
+diff --git a/test/live-source-budget.test.ts b/test/live-source-budget.test.ts
+index 9958701..695e8f6 100644
+--- a/test/live-source-budget.test.ts
++++ b/test/live-source-budget.test.ts
+@@ -8,6 +8,7 @@ import { SESSION_SOURCE_MAX_BYTES } from "../src/functions/observation-source-bu
+ import { getSearchIndex, setEmbeddingProvider, setVectorIndex } from "../src/functions/search.js";
+ import { payloadByteLength, SAFE_PAYLOAD_BYTES } from "../src/state/frame-guard.js";
+ import { KV } from "../src/state/schema.js";
++import { noteObservationWrite } from "../src/state/observation-tally.js";
+ 
+ vi.mock("../src/logger.js", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
+ 
+@@ -33,6 +34,7 @@ function rig(mode: "observe" | "compress") {
+     set: async (key: string, id: string, value: unknown) => {
+       if (!store.has(key)) store.set(key, new Map());
+       store.get(key)!.set(id, value);
++      noteObservationWrite(kv, key, id, value);
+       return value;
+     },
+     update: vi.fn(),
+diff --git a/test/observation-scope-reads.test.ts b/test/observation-scope-reads.test.ts
+new file mode 100644
+index 0000000..4b5b0e1
+--- /dev/null
++++ b/test/observation-scope-reads.test.ts
+@@ -0,0 +1,162 @@
++import { describe, it, expect, vi, afterEach } from "vitest";
++import { mockKV, mockSdk } from "./helpers/mocks.js";
++import { observationRowTotals, sessionObservationTotals } from "../src/state/observation-tally.js";
++import type { CompressedObservation } from "../src/types.js";
++
++vi.mock("../src/logger.js", () => ({
++  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}));
++
++const SESSION = "ses_scope_reads";
++const SCOPE = `mem:obs:${SESSION}`;
++const xml =
++  "<type>file_read</type><title>Read configuration</title><facts><fact>Port configured</fact></facts><narrative>Read the configuration file.</narrative><concepts><concept>config</concept></concepts><files></files><importance>5</importance>";
++
++function payload(observationId?: string) {
++  return {
++    sessionId: SESSION,
++    hookType: "post_tool_use",
++    timestamp: new Date().toISOString(),
++    ...(observationId ? { observationId } : {}),
++    data: {
++      tool_name: "Read",
++      tool_input: { file_path: "src/foo.ts" },
++      tool_output: "file contents here",
++    },
++  };
++}
++
++function storedRow(id: string): CompressedObservation {
++  return {
++    id,
++    sessionId: SESSION,
++    timestamp: new Date().toISOString(),
++    type: "file_read",
++    title: "Read",
++    narrative: "Read a file.",
++    facts: [],
++    concepts: [],
++    files: [],
++    importance: 5,
++  } as CompressedObservation;
++}
++
++function countingKV() {
++  const kv = mockKV();
++  const listed: string[] = [];
++  const list = kv.list;
++  kv.list = async <T>(scope: string): Promise<T[]> => {
++    listed.push(scope);
++    return list<T>(scope);
++  };
++  return { kv, listed: () => listed.filter((s) => s === SCOPE).length };
++}
++
++describe("observation scope reads", () => {
++  afterEach(() => {
++    vi.unstubAllEnvs();
++  });
++
++  it("observe with auto-compress and no cap never lists the scope", async () => {
++    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
++    const { registerObserveFunction } = await import("../src/functions/observe.js");
++    const sdk = mockSdk({ looseTrigger: true });
++    const { kv, listed } = countingKV();
++    registerObserveFunction(sdk as never, kv as never);
++
++    for (let i = 0; i < 5; i++) await sdk.trigger("mem::observe", payload());
++    const durable = (await sdk.trigger("mem::observe", payload("obs_durable_00000001"))) as { observationId?: string };
++
++    expect(durable.observationId).toBe("obs_durable_00000001");
++    expect(listed()).toBe(0);
++  });
++
++  it("observe dedups a stored durable id with a single get", async () => {
++    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
++    const { registerObserveFunction } = await import("../src/functions/observe.js");
++    const sdk = mockSdk({ looseTrigger: true });
++    const { kv, listed } = countingKV();
++    registerObserveFunction(sdk as never, kv as never);
++    await kv.set(SCOPE, "obs_durable_00000002", storedRow("obs_durable_00000002"));
++
++    const result = (await sdk.trigger("mem::observe", payload("obs_durable_00000002"))) as {
++      deduplicated?: boolean;
++      existing?: boolean;
++    };
++
++    expect(result).toMatchObject({ deduplicated: true, existing: true });
++    expect(listed()).toBe(0);
++  });
++
++  it("observe enforces the per-session cap with one list across writes", async () => {
++    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
++    const { registerObserveFunction } = await import("../src/functions/observe.js");
++    const sdk = mockSdk({ looseTrigger: true });
++    const { kv, listed } = countingKV();
++    registerObserveFunction(sdk as never, kv as never, undefined, 3);
++
++    const results = [];
++    for (let i = 0; i < 4; i++) results.push((await sdk.trigger("mem::observe", payload())) as { success?: boolean });
++
++    expect(results.slice(0, 3).every((r) => r.success !== false)).toBe(true);
++    expect(results[3]).toMatchObject({ success: false });
++    expect(listed()).toBe(1);
++  });
++
++  it("synthetic observe budgets sources with one list across writes", async () => {
++    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
++    const { registerObserveFunction } = await import("../src/functions/observe.js");
++    const sdk = mockSdk({ looseTrigger: true });
++    const { kv, listed } = countingKV();
++    registerObserveFunction(sdk as never, kv as never);
++
++    for (let i = 0; i < 5; i++) await sdk.trigger("mem::observe", payload());
++
++    expect(listed()).toBe(1);
++  });
++
++  it("compress budgets sources with one list across writes", async () => {
++    const { registerCompressFunction } = await import("../src/functions/compress.js");
++    const sdk = mockSdk({ looseTrigger: true });
++    const { kv, listed } = countingKV();
++    registerCompressFunction(sdk as never, kv as never, { name: "test", compress: vi.fn(async () => xml), summarize: vi.fn() } as never);
++
++    for (let i = 0; i < 5; i++) {
++      const id = `obs_compress_${String(i).padStart(8, "0")}`;
++      const raw = { id, sessionId: SESSION, timestamp: new Date().toISOString(), hookType: "post_tool_use", toolName: "Read", toolOutput: "out", raw: {} };
++      const result = (await sdk.trigger("mem::compress", { observationId: id, sessionId: SESSION, raw })) as { success?: boolean };
++      expect(result.success).toBe(true);
++    }
++
++    expect(listed()).toBe(1);
++  });
++
++  it("keeps running totals equal to the stored rows through sets, replacements and deletes", async () => {
++    const { kv } = countingKV();
++    await kv.set(SCOPE, "a", storedRow("a"));
++    expect(await sessionObservationTotals(kv, SESSION)).toEqual(observationRowTotals([storedRow("a")]));
++
++    const replaced = { ...storedRow("a"), narrative: "A much longer narrative than before." };
++    await kv.set(SCOPE, "a", replaced);
++    await kv.set(SCOPE, "b", storedRow("b"));
++    await kv.set(SCOPE, "c", storedRow("c"));
++    await kv.delete(SCOPE, "b");
++
++    const rows = await kv.list<CompressedObservation>(SCOPE);
++    expect(await sessionObservationTotals(kv, SESSION)).toEqual(observationRowTotals(rows));
++    expect(await sessionObservationTotals(kv, SESSION, "a")).toEqual(observationRowTotals([storedRow("c")]));
++  });
++
++  it("drops the source rather than failing when the scope can't be read", async () => {
++    const { budgetLiveObservationSource } = await import("../src/functions/observation-source-budget.js");
++    const { kv } = countingKV();
++    kv.list = async () => {
++      throw new Error("Max payload size exceeded");
++    };
++    const row = { ...storedRow("big"), source: { hookType: "post_tool_use", toolName: "Read", originalBytes: 3 } } as CompressedObservation;
++
++    const totals = await sessionObservationTotals(kv, SESSION);
++    expect(totals).toBeNull();
++    expect(budgetLiveObservationSource(row, totals).source).toBeUndefined();
++  });
++});
