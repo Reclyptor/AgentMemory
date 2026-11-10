@@ -37,6 +37,17 @@ The build fails if one stops applying.
   which is quadratic over a session and, once the scope passes the SDK's
   100 MiB frame limit, drops the worker connection on every capture into that
   session. Upstream v0.9.33 still does this.
+- `local-reflect-bounds.patch`: the reflection bounds from upstream #1544,
+  ported to the pin (#1544 itself targets a newer tree). A cluster's concepts
+  are capped at 32, its evidence at 20 records per type within byte budgets,
+  the prompt at 64 KiB, the model response at 64 KiB, and an insight's title
+  and content at 256 B and 4 KiB. Reinforcing an insight refreshes its tags and
+  provenance to the bounded set, which shrinks legacy records. Insight list and
+  search validate `limit` (capped at 500) and refuse a response over the frame
+  guard. Without it, every insight carried its whole graph cluster as tags and
+  provenance (up to 5,784 concepts and 1,449 memory ids), and the insights
+  scope outgrew what the engine can serialize. Drop it once the pin moves past
+  a release that contains #1544.
 
 ## Tags
 

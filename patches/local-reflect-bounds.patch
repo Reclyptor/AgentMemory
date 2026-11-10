@@ -1,0 +1,332 @@
+diff --git a/src/functions/reflect.ts b/src/functions/reflect.ts
+index b93a5dc..6cc8d40 100644
+--- a/src/functions/reflect.ts
++++ b/src/functions/reflect.ts
+@@ -12,6 +12,52 @@ import type {
+ } from "../types.js";
+ import { recordAudit } from "./audit.js";
+ import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
++import { checkPayloadFrameSize, payloadByteLength } from "../state/frame-guard.js";
++
++// Bounds from upstream #1544. A graph cluster can span thousands of concepts
++// and match thousands of records; without them every insight carried the whole
++// cluster as tags and provenance, and the insights scope outgrew one engine
++// frame.
++export const INSIGHT_MAX_RESULTS = 500;
++export const INSIGHT_MAX_SOURCES = 20;
++export const INSIGHT_MAX_TITLE_BYTES = 256;
++export const REFLECT_MAX_RECORD_BYTES = 4 * 1024;
++export const REFLECT_MAX_TYPE_BYTES = 16 * 1024;
++export const REFLECT_MAX_CONCEPTS = 32;
++export const REFLECT_MAX_CONCEPT_BYTES = 128;
++export const REFLECT_MAX_RESPONSE_BYTES = 64 * 1024;
++
++export function boundConcepts(candidates: string[]): string[] {
++  return [...new Set(candidates)]
++    .filter((name) => payloadByteLength(name) <= REFLECT_MAX_CONCEPT_BYTES)
++    .slice(0, REFLECT_MAX_CONCEPTS);
++}
++
++function selectEvidence<T extends { id: string }>(items: T[], record: (item: T) => unknown): T[] {
++  const selected: T[] = [];
++  const seen = new Set<string>();
++  let bytes = 0;
++  for (const item of items) {
++    if (selected.length >= INSIGHT_MAX_SOURCES) break;
++    if (seen.has(item.id)) continue;
++    const size = payloadByteLength([item.id, record(item)]);
++    if (size > REFLECT_MAX_RECORD_BYTES || bytes + size > REFLECT_MAX_TYPE_BYTES) continue;
++    selected.push(item);
++    seen.add(item.id);
++    bytes += size;
++  }
++  return selected;
++}
++
++function positiveLimit(value: unknown, fallback: number, maximum: number): number | null {
++  if (value === undefined) return fallback;
++  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return null;
++  return Math.min(value, maximum);
++}
++
++function invalidOption(error: string): { success: false; invalid: true; error: string } {
++  return { success: false, invalid: true, error };
++}
+ 
+ interface ConceptCluster {
+   concepts: string[];
+@@ -167,7 +213,8 @@ export function registerReflectFunctions(
+ ): void {
+   sdk.registerFunction("mem::reflect", 
+     async (data: { maxClusters?: number; project?: string }) => {
+-      const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
++      const maxClusters = positiveLimit(data?.maxClusters, 10, 20);
++      if (maxClusters === null) return invalidOption("maxClusters must be a positive safe integer");
+       const maxInsightsPerCluster = 5;
+       const maxTotal = 50;
+ 
+@@ -205,30 +252,31 @@ export function registerReflectFunctions(
+       let clustersSkipped = 0;
+       let totalInsights = 0;
+ 
+-      for (const conceptNames of conceptClusters) {
++      for (const candidates of conceptClusters) {
+         if (totalInsights >= maxTotal) break;
++        const conceptNames = boundConcepts(candidates);
+ 
+         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
+ 
+-        const clusterFacts = semanticMemories.filter((s) => {
++        const clusterFacts = selectEvidence(semanticMemories.filter((s) => {
+           const factTerms = s.fact.toLowerCase().split(/\s+/);
+           return factTerms.some((t) => conceptSet.has(t));
+-        });
++        }), (f) => ({ fact: f.fact, confidence: f.confidence }));
+ 
+-        const clusterLessons = activeLessons.filter((l) =>
++        const clusterLessons = selectEvidence(activeLessons.filter((l) =>
+           l.tags.some((t) => conceptSet.has(t.toLowerCase())) ||
+           conceptNames.some((c) =>
+             l.content.toLowerCase().includes(c.toLowerCase()),
+           ),
+-        );
++        ), (l) => ({ content: l.content, confidence: l.confidence }));
+ 
+-        const clusterCrystals = crystals.filter((c) =>
++        const clusterCrystals = selectEvidence(crystals.filter((c) =>
+           (c.lessons || []).some((l) =>
+             conceptNames.some((cn) =>
+               l.toLowerCase().includes(cn.toLowerCase()),
+             ),
+           ),
+-        );
++        ), (c) => ({ narrative: c.narrative }));
+ 
+         const totalItems =
+           clusterFacts.length + clusterLessons.length + clusterCrystals.length;
+@@ -256,6 +304,7 @@ export function registerReflectFunctions(
+         try {
+           const prompt = buildReflectPrompt(cluster);
+           const response = await provider.summarize(REFLECT_SYSTEM, prompt);
++          if (Buffer.byteLength(response, "utf8") > REFLECT_MAX_RESPONSE_BYTES) continue;
+ 
+           const insightRegex =
+             /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
+@@ -275,11 +324,22 @@ export function registerReflectFunctions(
+             const content = match[3].trim();
+ 
+             if (!content) continue;
++            if (
++              Buffer.byteLength(title, "utf8") > INSIGHT_MAX_TITLE_BYTES ||
++              Buffer.byteLength(content, "utf8") > REFLECT_MAX_RECORD_BYTES
++            ) continue;
+ 
+             const fp = fingerprintId("ins", content.trim().toLowerCase());
+             const existing = await kv.get<Insight>(KV.insights, fp);
+ 
+             if (existing && !existing.deleted) {
++              Object.assign(existing, {
++                sourceConceptCluster: conceptNames,
++                sourceMemoryIds: cluster.factIds,
++                sourceLessonIds: cluster.lessonIds,
++                sourceCrystalIds: cluster.crystalIds,
++                tags: conceptNames,
++              });
+               reinforceInsight(existing);
+               await kv.set(KV.insights, existing.id, existing);
+               reinforced++;
+@@ -340,7 +400,8 @@ export function registerReflectFunctions(
+       minConfidence?: number;
+       limit?: number;
+     }) => {
+-      const limit = data?.limit ?? 50;
++      const limit = positiveLimit(data?.limit, 50, INSIGHT_MAX_RESULTS);
++      if (limit === null) return invalidOption("limit must be a positive safe integer");
+       const minConfidence = data?.minConfidence ?? 0;
+       let items = await kv.list<Insight>(KV.insights);
+ 
+@@ -354,7 +415,8 @@ export function registerReflectFunctions(
+ 
+       items.sort((a, b) => b.confidence - a.confidence);
+ 
+-      return { success: true, insights: items.slice(0, limit) };
++      const result = { success: true, insights: items.slice(0, limit) };
++      return checkPayloadFrameSize(result, "reduce limit or filter by project") ?? result;
+     },
+   );
+ 
+@@ -371,7 +433,8 @@ export function registerReflectFunctions(
+ 
+       const query = data.query.toLowerCase();
+       const minConfidence = data.minConfidence ?? 0.1;
+-      const limit = data.limit ?? 10;
++      const limit = positiveLimit(data.limit, 10, INSIGHT_MAX_RESULTS);
++      if (limit === null) return invalidOption("limit must be a positive safe integer");
+ 
+       let items = await kv.list<Insight>(KV.insights);
+       items = items.filter(
+@@ -412,13 +475,14 @@ export function registerReflectFunctions(
+         });
+       } catch {}
+ 
+-      return {
++      const result = {
+         success: true,
+         insights: scored.slice(0, limit).map((s) => ({
+           ...s.insight,
+           score: Math.round(s.score * 1000) / 1000,
+         })),
+       };
++      return checkPayloadFrameSize(result, "reduce limit or narrow the search") ?? result;
+     },
+   );
+ 
+diff --git a/src/prompts/reflect.ts b/src/prompts/reflect.ts
+index 6de8435..1ef7bf0 100644
+--- a/src/prompts/reflect.ts
++++ b/src/prompts/reflect.ts
+@@ -1,3 +1,5 @@
++export const REFLECT_MAX_PROMPT_BYTES = 64 * 1024;
++
+ export const REFLECT_SYSTEM = `You are a higher-order reasoning engine. Given a cluster of related concepts, facts, lessons, and action outcomes, synthesize cross-cutting insights that span multiple individual memories.
+ 
+ Output format (XML):
+@@ -51,5 +53,9 @@ export function buildReflectPrompt(cluster: {
+     );
+   }
+ 
+-  return `Synthesize higher-order insights from this cluster of related memories:\n\n${sections.join("\n")}`;
++  const prompt = `Synthesize higher-order insights from this cluster of related memories:\n\n${sections.join("\n")}`;
++  if (Buffer.byteLength(REFLECT_SYSTEM, "utf8") + Buffer.byteLength(prompt, "utf8") > REFLECT_MAX_PROMPT_BYTES) {
++    throw new Error("Reflection prompt exceeds its byte budget");
++  }
++  return prompt;
+ }
+diff --git a/test/reflect-bounds.test.ts b/test/reflect-bounds.test.ts
+new file mode 100644
+index 0000000..215f984
+--- /dev/null
++++ b/test/reflect-bounds.test.ts
+@@ -0,0 +1,122 @@
++import { describe, it, expect, beforeEach, vi } from "vitest";
++import { mockKV, mockSdk } from "./helpers/mocks.js";
++
++vi.mock("../src/logger.js", () => ({
++  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}));
++
++import {
++  registerReflectFunctions,
++  INSIGHT_MAX_SOURCES,
++  REFLECT_MAX_CONCEPTS,
++  REFLECT_MAX_RESPONSE_BYTES,
++} from "../src/functions/reflect.js";
++import { REFLECT_MAX_PROMPT_BYTES, REFLECT_SYSTEM } from "../src/prompts/reflect.js";
++import { fingerprintId } from "../src/state/schema.js";
++import type { Insight } from "../src/types.js";
++
++const RESPONSE = `<insights>
++<insight confidence="0.8" title="Layered checks">
++Validation, safe APIs and tests together catch what each alone misses.
++</insight>
++</insights>`;
++const CONTENT = "Validation, safe APIs and tests together catch what each alone misses.";
++
++// One connected graph cluster of 400 concepts, with far more matching facts and
++// lessons than any prompt or insight should carry.
++async function seedGiantCluster(kv: ReturnType<typeof mockKV>) {
++  const now = "2026-04-01T00:00:00Z";
++  for (let i = 0; i < 400; i++) {
++    await kv.set("mem:graph:nodes", `node_c${i}`, {
++      id: `node_c${i}`, type: "concept", name: `c${i}`, properties: {}, sourceObservationIds: [], createdAt: now,
++    });
++    if (i > 0) {
++      await kv.set("mem:graph:edges", `edge_${i}`, {
++        id: `edge_${i}`, type: "related_to", sourceNodeId: `node_c${i - 1}`, targetNodeId: `node_c${i}`,
++        weight: 1, sourceObservationIds: [], createdAt: now,
++      });
++    }
++  }
++  for (let i = 0; i < 300; i++) {
++    await kv.set("mem:semantic", `sem_${i}`, {
++      id: `sem_${i}`, fact: `c${i % 32} fact number ${i} ${"detail ".repeat(40)}`, confidence: 0.8,
++      sourceSessionIds: [], sourceMemoryIds: [], accessCount: 1, lastAccessedAt: now, strength: 0.8,
++      createdAt: now, updatedAt: now,
++    });
++  }
++  for (let i = 0; i < 100; i++) {
++    await kv.set("mem:lessons", `lsn_${i}`, {
++      id: `lsn_${i}`, content: `lesson ${i} about c${i % 32}`, context: "", confidence: 0.7, reinforcements: 0,
++      source: "manual", sourceIds: [], tags: [`c${i % 32}`], createdAt: now, updatedAt: now, decayRate: 0.05,
++    });
++  }
++}
++
++describe("reflection bounds", () => {
++  let sdk: ReturnType<typeof mockSdk>;
++  let kv: ReturnType<typeof mockKV>;
++  let summarize: ReturnType<typeof vi.fn>;
++
++  beforeEach(() => {
++    sdk = mockSdk();
++    kv = mockKV();
++    summarize = vi.fn().mockResolvedValue(RESPONSE);
++    registerReflectFunctions(sdk as never, kv as never, { name: "test", compress: vi.fn(), summarize } as never);
++  });
++
++  it("bounds concepts, provenance and the prompt for a giant cluster", async () => {
++    await seedGiantCluster(kv);
++
++    const result = (await sdk.trigger("mem::reflect", {})) as { success: boolean; newInsights: number };
++    expect(result.success).toBe(true);
++    expect(result.newInsights).toBe(1);
++
++    for (const [system, prompt] of summarize.mock.calls as Array<[string, string]>) {
++      expect(Buffer.byteLength(system) + Buffer.byteLength(prompt)).toBeLessThanOrEqual(REFLECT_MAX_PROMPT_BYTES);
++    }
++    const [insight] = await kv.list<Insight>("mem:insights");
++    expect(insight!.tags.length).toBeLessThanOrEqual(REFLECT_MAX_CONCEPTS);
++    expect(insight!.sourceConceptCluster).toEqual(insight!.tags);
++    expect(insight!.sourceMemoryIds.length).toBeLessThanOrEqual(INSIGHT_MAX_SOURCES);
++    expect(insight!.sourceLessonIds.length).toBeLessThanOrEqual(INSIGHT_MAX_SOURCES);
++  });
++
++  it("shrinks a legacy oversized insight when reflection reinforces it", async () => {
++    await seedGiantCluster(kv);
++    const id = fingerprintId("ins", CONTENT.toLowerCase());
++    const huge = Array.from({ length: 5000 }, (_, i) => `legacy concept ${i}`);
++    await kv.set("mem:insights", id, {
++      id, title: "Layered checks", content: CONTENT, confidence: 0.5, reinforcements: 0,
++      sourceConceptCluster: huge, tags: huge,
++      sourceMemoryIds: Array.from({ length: 1500 }, (_, i) => `sem_old_${i}`),
++      sourceLessonIds: [], sourceCrystalIds: [],
++      createdAt: "2026-04-01T00:00:00Z", updatedAt: "2026-04-01T00:00:00Z", decayRate: 0.05,
++    });
++
++    const result = (await sdk.trigger("mem::reflect", {})) as { reinforced: number };
++    expect(result.reinforced).toBe(1);
++
++    const stored = (await kv.get<Insight>("mem:insights", id))!;
++    expect(stored.reinforcements).toBe(1);
++    expect(stored.tags.length).toBeLessThanOrEqual(REFLECT_MAX_CONCEPTS);
++    expect(stored.sourceMemoryIds.length).toBeLessThanOrEqual(INSIGHT_MAX_SOURCES);
++  });
++
++  it("skips an oversized model response", async () => {
++    await seedGiantCluster(kv);
++    summarize.mockResolvedValue(`${RESPONSE}\n${" ".repeat(REFLECT_MAX_RESPONSE_BYTES)}`);
++
++    const result = (await sdk.trigger("mem::reflect", {})) as { newInsights: number };
++    expect(result.newInsights).toBe(0);
++  });
++
++  it("rejects invalid limits and caps insight list results", async () => {
++    expect(await sdk.trigger("mem::insight-list", { limit: 0 })).toMatchObject({ success: false, invalid: true });
++    expect(await sdk.trigger("mem::insight-search", { query: "x", limit: -1 })).toMatchObject({ success: false, invalid: true });
++    expect(await sdk.trigger("mem::reflect", { maxClusters: 1.5 })).toMatchObject({ success: false, invalid: true });
++  });
++
++  it("keeps the system prompt inside the budget on its own", () => {
++    expect(Buffer.byteLength(REFLECT_SYSTEM)).toBeLessThan(REFLECT_MAX_PROMPT_BYTES / 4);
++  });
++});
